@@ -109,11 +109,16 @@ def initialize_retriever():
     if "retriever" in st.session_state:
         return
     
-    # RAGの参照先となるデータソースの読み込み
-    docs_all = load_data_sources()
+    # RAGの参照先となるデータソースの読み込み（CSV と その他ファイルを分離）
+    docs_csv, docs_other = load_data_sources()
 
     # OSがWindowsの場合、Unicode正規化と、cp932（Windows用の文字コード）で表現できない文字を除去
-    for doc in docs_all:
+    for doc in docs_csv:
+        doc.page_content = adjust_string(doc.page_content)
+        for key in doc.metadata:
+            doc.metadata[key] = adjust_string(doc.metadata[key])
+    
+    for doc in docs_other:
         doc.page_content = adjust_string(doc.page_content)
         for key in doc.metadata:
             doc.metadata[key] = adjust_string(doc.metadata[key])
@@ -121,21 +126,30 @@ def initialize_retriever():
     # 埋め込みモデルの用意
     embeddings = OpenAIEmbeddings()
     
-    # チャンク分割用のオブジェクトを作成
+    # PDF/DOCX/TXT用チャンク分割オブジェクトを作成
     text_splitter = CharacterTextSplitter(
-        chunk_size=500,
-        chunk_overlap=50,
+        chunk_size=ct.CHUNK_SIZE,
+        chunk_overlap=ct.CHUNK_OVERLAP,
         separator="\n"
     )
 
-    # チャンク分割を実施
-    splitted_docs = text_splitter.split_documents(docs_all)
+    # CSV はレコード単位（分割しない）、 PDF/DOCX/TXT/WEB は500文字単位で分割
+    splitted_docs_csv = docs_csv  # CSV はそのまま（レコード = チャンク）
+    splitted_docs_other = text_splitter.split_documents(docs_other)
+    
+    # 両方を統合
+    splitted_docs = splitted_docs_csv + splitted_docs_other
 
     # ベクターストアの作成
-    db = Chroma.from_documents(splitted_docs, embedding=embeddings)
+    # db_csv = Chroma.from_documents(splitted_docs_csv, embedding=embeddings)
+    db_doc = Chroma.from_documents(splitted_docs_other, embedding=embeddings)
 
     # ベクターストアを検索するRetrieverの作成
-    st.session_state.retriever = db.as_retriever(search_kwargs={"k": 3})
+    # st.session_state.retriever_csv = db_csv.as_retriever(search_kwargs={"k": ct.SEARCH_K_CSV})
+    st.session_state.retriever_doc = db_doc.as_retriever(search_kwargs={"k": ct.SEARCH_K_DOC})
+
+    # CSVドキュメントをセッションに保持（CSV検索の全文一致用）
+    st.session_state.csv_documents = splitted_docs_csv
 
 
 def initialize_session_state():
@@ -154,12 +168,13 @@ def load_data_sources():
     RAGの参照先となるデータソースの読み込み
 
     Returns:
-        読み込んだ通常データソース
+        (読み込んだCSVドキュメント, 読み込んだその他のドキュメント)
     """
     # データソースを格納する用のリスト
-    docs_all = []
+    docs_csv = []
+    docs_other = []
     # ファイル読み込みの実行（渡した各リストにデータが格納される）
-    recursive_file_check(ct.RAG_TOP_FOLDER_PATH, docs_all)
+    recursive_file_check(ct.RAG_TOP_FOLDER_PATH, docs_csv, docs_other)
 
     web_docs_all = []
     # ファイルとは別に、指定のWebページ内のデータも読み込み
@@ -170,19 +185,20 @@ def load_data_sources():
         web_docs = loader.load()
         # for文の外のリストに読み込んだデータソースを追加
         web_docs_all.extend(web_docs)
-    # 通常読み込みのデータソースにWebページのデータを追加
-    docs_all.extend(web_docs_all)
+    # その他のドキュメントにWebページのデータを追加
+    docs_other.extend(web_docs_all)
 
-    return docs_all
+    return docs_csv, docs_other
 
 
-def recursive_file_check(path, docs_all):
+def recursive_file_check(path, docs_csv, docs_other):
     """
     RAGの参照先となるデータソースの読み込み
 
     Args:
         path: 読み込み対象のファイル/フォルダのパス
-        docs_all: データソースを格納する用のリスト
+        docs_csv: CSVドキュメントを格納するリスト
+        docs_other: その他のドキュメントを格納するリスト
     """
     # パスがフォルダかどうかを確認
     if os.path.isdir(path):
@@ -193,19 +209,20 @@ def recursive_file_check(path, docs_all):
             # ファイル/フォルダ名だけでなく、フルパスを取得
             full_path = os.path.join(path, file)
             # フルパスを渡し、再帰的にファイル読み込みの関数を実行
-            recursive_file_check(full_path, docs_all)
+            recursive_file_check(full_path, docs_csv, docs_other)
     else:
         # パスがファイルの場合、ファイル読み込み
-        file_load(path, docs_all)
+        file_load(path, docs_csv, docs_other)
 
 
-def file_load(path, docs_all):
+def file_load(path, docs_csv, docs_other):
     """
     ファイル内のデータ読み込み
 
     Args:
         path: ファイルパス
-        docs_all: データソースを格納する用のリスト
+        docs_csv: CSVドキュメントを格納するリスト
+        docs_other: その他のドキュメントを格納するリスト
     """
     # ファイルの拡張子を取得
     file_extension = os.path.splitext(path)[1]
@@ -217,7 +234,12 @@ def file_load(path, docs_all):
         # ファイルの拡張子に合ったdata loaderを使ってデータ読み込み
         loader = ct.SUPPORTED_EXTENSIONS[file_extension](path)
         docs = loader.load()
-        docs_all.extend(docs)
+        
+        # CSV と それ以外で分離
+        if file_extension == ".csv":
+            docs_csv.extend(docs)
+        else:
+            docs_other.extend(docs)
 
 
 def adjust_string(s):

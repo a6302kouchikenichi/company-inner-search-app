@@ -6,6 +6,8 @@
 # ライブラリの読み込み
 ############################################################
 import os
+import re
+import unicodedata
 from dotenv import load_dotenv
 import streamlit as st
 from langchain.prompts import ChatPromptTemplate, MessagesPlaceholder
@@ -59,6 +61,96 @@ def build_error_message(message):
     return "\n".join([message, ct.COMMON_ERROR_MESSAGE])
 
 
+def is_csv_query(chat_message):
+    """
+    質問が社員情報（CSV）クエリかどうかを決定
+
+    Args:
+        chat_message: ユーザー入力値
+
+    Returns:
+        CSVクエリの場合True、そうではFalse
+    """
+    # 「社員情報」を含む場合をCSV検索と判定
+    return "社員情報" in chat_message
+
+
+def normalize_text(text):
+    """
+    検索用にテキストを正規化
+
+    Args:
+        text: 入力テキスト
+
+    Returns:
+        正規化済みテキスト
+    """
+    if not text:
+        return ""
+
+    return unicodedata.normalize("NFKC", text).strip()
+
+
+def extract_query_tokens(chat_message):
+    """
+    クエリから検索用トークンを抽出
+
+    Args:
+        chat_message: ユーザー入力値
+
+    Returns:
+        抽出トークンのリスト
+    """
+    text = normalize_text(chat_message).replace("社員情報", "")
+    text = re.sub(r"[、。,.()\[\]{}:：/\\\n\r\t]+", " ", text)
+    tokens = re.findall(r"[A-Za-z0-9]+|[一-龥々〆ヵヶぁ-んァ-ヶー]+", text)
+    return [token for token in tokens if len(token) >= 2]
+
+
+def select_csv_documents(docs, chat_message):
+    """
+    CSVドキュメントを文字列スコアで選別
+
+    Args:
+        docs: CSVドキュメントのリスト
+        chat_message: ユーザー入力値
+
+    Returns:
+        (選別済みドキュメント, デバッグ情報)
+    """
+    query_text = normalize_text(chat_message).replace("社員情報", "")
+    tokens = extract_query_tokens(chat_message)
+
+    scored_docs = []
+    for doc in docs:
+        values = []
+        for line in doc.page_content.splitlines():
+            if ": " in line:
+                _, value = line.split(": ", 1)
+                value = value.strip()
+                if value:
+                    values.append(value)
+
+        score = 0
+        for value in values:
+            if len(value) >= 2 and value in query_text:
+                score += 2
+
+        row_text = " ".join(values)
+        for token in tokens:
+            if token in row_text:
+                score += 1
+
+        if score > 0:
+            scored_docs.append((score, doc))
+
+    if not scored_docs:
+        return docs, {"tokens": tokens, "matched": 0}
+
+    scored_docs.sort(key=lambda item: item[0], reverse=True)
+    return [doc for _, doc in scored_docs], {"tokens": tokens, "matched": len(scored_docs)}
+
+
 def get_llm_response(chat_message):
     """
     LLMからの回答取得
@@ -71,6 +163,13 @@ def get_llm_response(chat_message):
     """
     # LLMのオブジェクトを用意
     llm = ChatOpenAI(model_name=ct.MODEL, temperature=ct.TEMPERATURE)
+    
+    # キーワード判定
+    is_csv = is_csv_query(chat_message)
+    if is_csv:
+        retriever = None
+    else:
+        retriever = st.session_state.retriever_doc
 
     # 会話履歴なしでもLLMに理解してもらえる、独立した入力テキストを取得するためのプロンプトテンプレートを作成
     question_generator_template = ct.SYSTEM_PROMPT_CREATE_INDEPENDENT_TEXT
@@ -98,18 +197,45 @@ def get_llm_response(chat_message):
         ]
     )
 
-    # 会話履歴なしでもLLMに理解してもらえる、独立した入力テキストを取得するためのRetrieverを作成
-    history_aware_retriever = create_history_aware_retriever(
-        llm, st.session_state.retriever, question_generator_prompt
-    )
-
     # LLMから回答を取得する用のChainを作成
     question_answer_chain = create_stuff_documents_chain(llm, question_answer_prompt)
-    # 「RAG x 会話履歴の記憶機能」を実現するためのChainを作成
-    chain = create_retrieval_chain(history_aware_retriever, question_answer_chain)
 
-    # LLMへのリクエストとレスポンス取得
-    llm_response = chain.invoke({"input": chat_message, "chat_history": st.session_state.chat_history})
+    if is_csv:
+        csv_docs = st.session_state.get("csv_documents", [])
+        filtered_docs, debug_info = select_csv_documents(csv_docs, chat_message)
+        answer = question_answer_chain.invoke(
+            {
+                "input": chat_message,
+                "chat_history": st.session_state.chat_history,
+                "context": filtered_docs,
+            }
+        )
+        answer_text = answer.content if hasattr(answer, "content") else answer
+        llm_response = {"answer": answer_text, "context": filtered_docs}
+    else:
+        # 会話履歴なしでもLLMに理解してもらえる、独立した入力テキストを取得するためのRetrieverを作成
+        history_aware_retriever = create_history_aware_retriever(
+            llm, retriever, question_generator_prompt
+        )
+
+        # 「RAG x 会話履歴の記憶機能」を実現するためのChainを作成
+        chain = create_retrieval_chain(history_aware_retriever, question_answer_chain)
+
+        # LLMへのリクエストとレスポンス取得
+        llm_response = chain.invoke({"input": chat_message, "chat_history": st.session_state.chat_history})
+    
+    # デバッグ用ログ出力
+    import logging
+    logger = logging.getLogger(ct.LOGGER_NAME)
+    if "context" in llm_response:
+        logger.info(f"検索されたドキュメント数: {len(llm_response['context'])}")
+        if llm_response['context']:
+            sources = [doc.metadata.get('source', 'unknown') for doc in llm_response['context']]
+            logger.info(f"参照元: {sources}")
+        if is_csv:
+            logger.info(f"CSV検索トークン: {debug_info.get('tokens', [])}")
+            logger.info(f"CSV一致件数: {debug_info.get('matched', 0)}")
+    
     # LLMレスポンスを会話履歴に追加
     st.session_state.chat_history.extend([HumanMessage(content=chat_message), llm_response["answer"]])
 
