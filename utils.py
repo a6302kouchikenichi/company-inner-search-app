@@ -75,38 +75,6 @@ def is_csv_query(chat_message):
     return "社員情報" in chat_message
 
 
-def normalize_text(text):
-    """
-    検索用にテキストを正規化
-
-    Args:
-        text: 入力テキスト
-
-    Returns:
-        正規化済みテキスト
-    """
-    if not text:
-        return ""
-
-    return unicodedata.normalize("NFKC", text).strip()
-
-
-def extract_query_tokens(chat_message):
-    """
-    クエリから検索用トークンを抽出
-
-    Args:
-        chat_message: ユーザー入力値
-
-    Returns:
-        抽出トークンのリスト
-    """
-    text = normalize_text(chat_message).replace("社員情報", "")
-    text = re.sub(r"[、。,.()\[\]{}:：/\\\n\r\t]+", " ", text)
-    tokens = re.findall(r"[A-Za-z0-9]+|[一-龥々〆ヵヶぁ-んァ-ヶー]+", text)
-    return [token for token in tokens if len(token) >= 2]
-
-
 def select_csv_documents(docs, chat_message):
     """
     CSVドキュメントを文字列スコアで選別
@@ -118,8 +86,12 @@ def select_csv_documents(docs, chat_message):
     Returns:
         (選別済みドキュメント, デバッグ情報)
     """
-    query_text = normalize_text(chat_message).replace("社員情報", "")
-    tokens = extract_query_tokens(chat_message)
+    query_text = chat_message.replace("社員情報", "")
+    query_text = unicodedata.normalize("NFKC", query_text)
+    query_text = query_text.strip()
+    token_text = re.sub(r"[、。,.()\[\]{}:：/\\\n\r\t]+", " ", query_text)
+    tokens = re.findall(r"[A-Za-z0-9]+|[一-龥々〆ヵヶぁ-んァ-ヶー]+", token_text)
+    tokens = [token for token in tokens if len(token) >= 2]
 
     scored_docs = []
     for doc in docs:
